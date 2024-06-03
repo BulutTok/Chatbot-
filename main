@@ -1,0 +1,195 @@
+import fitz  # PyMuPDF
+import json
+import openai
+import os
+import re
+import pandas as pd
+
+# Set your OpenAI API key
+openai.api_key = <open_api_key>
+
+# Path to the CSV file containing core course information
+csv_path = '/Users/buluttok/UNCW_Core_Courses.csv'
+
+def read_course_info_from_csv(csv_path):
+    df = pd.read_csv(csv_path)
+    course_dict = {}
+    for _, row in df.iterrows():
+        course_code = row['Course Code']
+        course_dict[course_code] = {
+            'name': row['Class Name'],
+            'credits': row['Class Credits'],
+            'prerequisites': row['Prerequisites']
+        }
+    return course_dict
+
+# Read the core classes information from the CSV
+core_classes_info = read_course_info_from_csv(csv_path)
+
+def pdf_to_json(pdf_path):
+    # Open the PDF file
+    pdf_document = fitz.open(pdf_path)
+    
+    # Dictionary to hold the PDF content
+    pdf_content = {}
+    
+    # Loop through each page
+    for page_num in range(len(pdf_document)):
+        page = pdf_document.load_page(page_num)  # Load each page
+        text = page.get_text("text")  # Extract text from the page
+        pdf_content[f"Page_{page_num + 1}"] = text  # Add text to dictionary
+
+    # Convert the dictionary to a JSON string and return it
+    json_content = json.dumps(pdf_content, ensure_ascii=False, indent=4)
+    return json_content
+
+def extract_student_info(json_obj):
+    student_info = {'name': 'N/A', 'department': 'N/A', 'advisor': 'N/A', 'gpa': 'N/A'}
+    content = " ".join(json_obj.values())
+    
+    # Regular expressions for matching the relevant information
+    name_pattern = re.compile(r"Student name[:\s]*([^\n]+)", re.IGNORECASE)
+    department_pattern = re.compile(r"(?:Plan description|Department)[:\s]*([^\n]+)", re.IGNORECASE)
+    advisor_pattern = re.compile(r"Primary Advisor[:\s]*([^\n]+)", re.IGNORECASE)
+    gpa_pattern = re.compile(r"\bGPA[:\s]*([\d\.]+)", re.IGNORECASE)
+
+    # Search for patterns in the content
+    name_match = name_pattern.search(content)
+    if name_match:
+        student_info['name'] = name_match.group(1).strip()
+
+    department_match = department_pattern.search(content)
+    if department_match:
+        student_info['department'] = department_match.group(1).strip()
+
+    advisor_match = advisor_pattern.search(content)
+    if advisor_match:
+        student_info['advisor'] = advisor_match.group(1).strip()
+
+    gpa_match = gpa_pattern.search(content)
+    if gpa_match:
+        student_info['gpa'] = gpa_match.group(1).strip()
+
+    return student_info
+
+def extract_credits(json_obj):
+    completed_classes = []
+    in_progress_classes = []
+    completed_credits = 0
+    in_progress_credits = 0
+
+    current_status = None
+    for page, content in json_obj.items():
+        lines = content.split('\n')
+        for line in lines:
+            if 'COMPLETE' in line and not re.search(r'\b[A-Z]{3}\s+\d{3}\b', line):
+                current_status = 'complete'
+            elif 'IN-PROGRESS' in line:
+                current_status = 'in-progress'
+            elif re.search(r'\b[A-Z]{3}\s+\d{3}\b', line):
+                course_info = re.split(r'\s{2,}', line.strip())
+                if len(course_info) >= 4:
+                    course_code = course_info[0]
+                    course_title = course_info[1]
+                    grade = course_info[2]
+                    credits = course_info[3]
+
+                    try:
+                        credits = float(credits.replace('(', '').replace(')', ''))
+                    except ValueError:
+                        continue
+
+                    if current_status == 'complete':
+                        completed_classes.append((course_code, course_title, grade, credits))
+                        completed_credits += credits
+                    elif current_status == 'in-progress':
+                        in_progress_classes.append((course_code, course_title, grade, credits))
+                        in_progress_credits += credits
+
+    return completed_classes, in_progress_classes, completed_credits, in_progress_credits
+
+def check_prerequisites(course_name):
+    normalized_course_name = course_name.strip().lower()
+    for course_code, course_info in core_classes_info.items():
+        if course_info['name'].strip().lower() == normalized_course_name:
+            return (f"Course Code: {course_code}\n"
+                    f"Course: {course_info['name']}\n"
+                    f"Credits: {course_info['credits']}\n"
+                    f"Prerequisites: {course_info['prerequisites']}")
+    return None
+
+def handle_query(student_info, json_data, user_query):
+    # First, check if the query is about a course prerequisite
+    prerequisites_info = check_prerequisites(user_query)
+    if prerequisites_info:
+        return prerequisites_info
+
+    # Prepare the CSV data as a string
+    csv_data = "\n".join([f"{code}: {info['name']} ({info['credits']} credits), Prerequisites: {info['prerequisites']}" for code, info in core_classes_info.items()])
+
+    # If the query is not about a specific course's prerequisites, or no match was found in the dictionary, use OpenAI
+    prompt = (f"Hey {student_info.get('name', 'there')}! Here's the information from your records:\n\n{json_data}\n\n"
+              f"And here's the course information from the CSV file:\n\n{csv_data}\n\n"
+              f"Let's find the relevant information for your query: {user_query}")
+    
+    response = openai.ChatCompletion.create(
+        model="gpt-4-turbo",
+        messages=[
+            {"role": "system", "content": "You are a friendly and skillful academic advisor named Sammy SeaHawk who helps students with course information and prerequisites based on provided data."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=500  # Increase the max_tokens to print more words
+    )
+    return response.choices[0]['message']['content'].strip()
+
+def generate_report(completed_classes, in_progress_classes, completed_credits, in_progress_credits):
+    report = []
+
+    if completed_classes:
+        report.append("Completed Classes and Credits:")
+        for cls, title, grade, credits in completed_classes:
+            report.append(f"{cls} ({title}) - Grade: {grade}, Credits: {credits}")
+        report.append(f"Total Completed Credits: {completed_credits}\n")
+
+    if in_progress_classes:
+        report.append("In-Progress Classes and Credits:")
+        for cls, title, grade, credits in in_progress_classes:
+            report.append(f"{cls} ({title}) - Grade: {grade}, Credits: {credits}")
+        report.append(f"Total In-Progress Credits: {in_progress_credits}")
+
+    return "\n".join(report)
+
+def main():
+    print("Hey, I am Sammy SeaHawk! How can I help you today?")
+    # Specify the path to your PDF file
+    pdf_path = input("Enter the path to your PDF file: ")
+
+    # Convert PDF to JSON
+    json_data = pdf_to_json(pdf_path)
+    json_obj = json.loads(json_data)
+    
+    # Extract student information
+    student_info = extract_student_info(json_obj)
+    print(f"Hey {student_info['name']}, here's what I found for you:")
+    print(f"Department: {student_info['department']}")
+    print(f"Advisor: {student_info['advisor']}")
+    print(f"GPA: {student_info['gpa']}\n")
+
+    # Extract and print completed and in-progress classes and credits
+    completed_classes, in_progress_classes, completed_credits, in_progress_credits = extract_credits(json_obj)
+    report = generate_report(completed_classes, in_progress_classes, completed_credits, in_progress_credits)
+    if report:
+        print(report)
+
+    # Chat interaction
+    while True:
+        user_input = input("\nWhat can I help you with today? (or type 'exit' to quit): ")
+        if user_input.lower() == 'exit':
+            break
+        
+        response = handle_query(student_info, json_data, user_input)
+        print("\nResponse from Sammy SeaHawk:")
+        print(response)
+
+if __name__ == "__main__":
+    main()
