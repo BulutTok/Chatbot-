@@ -23,7 +23,4 @@ os
 re
 pandas
 
-```sh
-git clone https://github.com/BulutTok/sammy-seahawk-course-advisor.git
-cd sammy-seahawk-course-advisor
-pip install -r requirements.txt
+
